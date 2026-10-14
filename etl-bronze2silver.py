@@ -19,7 +19,7 @@ s3 = boto3.client("s3")
 
 bucket = os.getenv("BUCKET_NAME")
 bronze_prefixo = (
-    f"bronze/ano={data_ano}/mes={data_mes}/dia={data_dia}/hora={data_hora}/"
+    f"01-bronze/ano={data_ano}/mes={data_mes}/dia={data_dia}/hora={data_hora}/"
 )
 
 def processar_csv(dataframes_por_mac):
@@ -158,7 +158,7 @@ def enviar_csv(df, mac_geral):
     csv_buffer = StringIO()
     df.to_csv(csv_buffer, index=False)
 
-    object_key = f"silver/ano={data_ano}/mes={data_mes}/dia={data_dia}/hora={data_hora}/{mac_geral}_{data_hora}{data_minuto}_tratamento.csv"
+    object_key = f"02-silver/ano={data_ano}/mes={data_mes}/dia={data_dia}/hora={data_hora}/{mac_geral}_{data_hora}{data_minuto}_tratamento.csv"
     s3.put_object(
         Bucket=bucket,
         Key=object_key,
