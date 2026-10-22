@@ -52,6 +52,18 @@ grupos = {
 }
 
 def buscar_componentes_do_embarcado(mac_geral):
+
+    mac_geral_formatado = ""
+    cont = 0
+
+    for letrinha in mac_geral:
+        if cont == 2:
+            mac_geral_formatado += ":"
+            cont = 0
+        mac_geral_formatado += letrinha
+
+        cont += 1
+
     comando = """
         SELECT DISTINCT
             c.nome AS componente,
@@ -68,9 +80,8 @@ def buscar_componentes_do_embarcado(mac_geral):
           AND p.status = 1;
     """
 
-    cursor.execute(comando, (mac_geral,))
+    cursor.execute(comando, (mac_geral_formatado,))
     return cursor.fetchall()
-
 
 def verificar_limites(mac_geral, df):
     componentes = buscar_componentes_do_embarcado(mac_geral)
