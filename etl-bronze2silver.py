@@ -172,7 +172,7 @@ def carregar_csv():
     ultima_leitura = s3.list_objects_v2(Bucket=bucket, Prefix=bronze_prefixo)
 
     csv_keys = []
-    if ultima_leitura["Contents"] is None:
+    if ultima_leitura.get("Contents") is None:
         print("Não há nenhuma captura para a hora atual.")
         return
     for obj in ultima_leitura["Contents"]:
