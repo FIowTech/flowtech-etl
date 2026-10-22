@@ -8,14 +8,13 @@ from io import StringIO
 import mysql.connector
 import json
 
-
 load_dotenv()
 
 conexao = mysql.connector.connect(
     host=os.getenv("DB_HOST"),
     user=os.getenv("DB_USER"),
     password=os.getenv("DB_PASSWORD"),
-    database=os.getenv("DB_NAME")
+    database=os.getenv("DB_NAME"),
 )
 
 cursor = conexao.cursor(dictionary=True)
@@ -34,181 +33,163 @@ silver_prefixo = (
     f"02-silver/ano={data_ano}/mes={data_mes}/dia={data_dia}/hora={data_hora}/"
 )
 
+mapeamento_componentes = {
+    "cpu_uso": "cpu_uso_pct",
+    "cpu_freq": "cpu_freq_mhz",
+    "ram_uso": "ram_uso_pct",
+    "swap_uso": "swap_uso_pct",
+    "disco_uso": "disco_uso_pct",
+    "rede_download": "download_mb",
+    "rede_upload": "upload_mb",
+    "rede_latencia": "latencia_ms",
+}
+
+grupos = {
+    "cpu": ["cpu_uso_pct", "cpu_freq_mhz"],
+    "ram": ["ram_uso_pct", "swap_uso_pct"],
+    "disco": ["disco_uso_pct"],
+    "rede": ["download_mb", "upload_mb", "latencia_ms", "packet_loss"],
+}
+
+def buscar_componentes_do_embarcado(mac_geral):
+    comando = """
+        SELECT DISTINCT
+            c.nome AS componente,
+            p.limite_min,
+            p.limite_max
+        FROM parametro p
+        JOIN embarcado e
+            ON e.id_embarcado = p.embarcado_id
+           AND e.empresa_id = p.empresa_id
+        JOIN componente c
+            ON c.id_componente = p.componente_id
+        WHERE e.endereco_mac = %s
+          AND e.status = 1
+          AND p.status = 1;
+    """
+
+    cursor.execute(comando, (mac_geral,))
+    return cursor.fetchall()
+
+
 def verificar_limites(mac_geral, df):
-    componentes = [
-        "cpu_uso_pct",
-        "cpu_freq_mhz",
-        "ram_uso_pct",
-        "swap_uso_pct",
-        "disco_uso_pct",
-        "download_mb",
-        "upload_mb",
-        "latencia_ms",
-        "packet_loss"
-    ]
+    componentes = buscar_componentes_do_embarcado(mac_geral)
 
-    for componente in componentes:
-        comando = """
-            SELECT limite_max, limite_min
-            FROM parametro p
-            JOIN embarcado e ON p.embarcado_id = e.id_embarcado
-            JOIN componente c ON p.componente_id = c.id_componente
-            WHERE e.endereco_mac = %s AND c.nome = %s;
-        """
-        cursor.execute(comando, (mac_geral, componente))
+    for item in componentes:
+        componente_banco = item["componente"]
+        componente = mapeamento_componentes.get(componente_banco)
 
-        resultado = cursor.fetchone()
-
-        if resultado is None:
-            df[f"lim_max_{componente}"] = None
-            df[f"lim_min_{componente}"] = None
-            df[f"estado_{componente}"] = None
+        if componente is None:
             continue
-        df[f"lim_max_{componente}"] = resultado["limite_max"]
-        df[f"lim_min_{componente}"] = resultado["limite_min"]
 
-        df[f"estado_{componente}"] = (
-            (df[componente] >= resultado["limite_min"]) &
-            (df[componente] <= resultado["limite_max"])
-        )
+        if componente not in df.columns:
+            continue
+
+        limite_min = item["limite_min"]
+        limite_max = item["limite_max"]
+
+        df[f"lim_min_{componente}"] = limite_min
+        df[f"lim_max_{componente}"] = limite_max
+
+        if limite_min is not None and limite_max is not None:
+            df[f"estado_{componente}"] = (df[componente] >= limite_min) & (
+                df[componente] <= limite_max
+            )
+        else:
+            df[f"estado_{componente}"] = None
 
     return df
 
+
 def separar_componentes(mac_geral, df):
-    for indice, linha in df.iterrows():
-        cpu = {
-            "nome": "cpu",
-            "mac_adress": mac_geral,
-            "timestamp": linha["timestamp"],
-            "parametros": [
-                {
-                    "nome": "cpu_uso_pct",
-                    "valor": linha["cpu_uso_pct"],
-                    "estado": linha["estado_cpu_uso_pct"],
-                    "limite_min": linha["lim_min_cpu_uso_pct"],
-                    "limite_max": linha ["lim_max_cpu_uso_pct"],
-                },
-                {
-                    "nome": "cpu_freq_mhz",
-                    "valor": linha["cpu_freq_mhz"],
-                    "estado": linha["estado_cpu_freq_mhz"],
-                    "limite_min": linha["lim_min_cpu_freq_mhz"],
-                    "limite_max": linha ["lim_max_cpu_freq_mhz"],
-                },
-            ]
-        }
+    colunas_componentes = [
+        coluna
+        for coluna in df.columns
+        if not coluna.startswith(("lim_min_", "lim_max_", "estado_"))
+        and coluna not in ("endereco_mac", "timestamp")
+    ]
 
-        ram = {
-            "nome": "ram",
-            "mac_adress": mac_geral,
-            "timestamp": linha["timestamp"],
-            "parametros": [
-                {
-                    "nome": "ram_uso_pct",
-                    "valor": linha["ram_uso_pct"],
-                    "estado": linha["estado_ram_uso_pct"],
-                    "limite_min": linha["lim_min_ram_uso_pct"],
-                    "limite_max": linha ["lim_max_ram_uso_pct"],
-                },
-                {
-                    "nome": "swap_uso_pct",
-                    "valor": linha["swap_uso_pct"],
-                    "estado": linha["estado_swap_uso_pct"],
-                    "limite_min": linha["lim_min_swap_uso_pct"],
-                    "limite_max": linha ["lim_max_swap_uso_pct"],
-                },
-            ]
-        }
+    for _, linha in df.iterrows():
+        for nome_grupo, componentes_do_grupo in grupos.items():
+            parametros = []
 
-        disco = {
-            "nome": "disco",
-            "mac_adress": mac_geral,
-            "timestamp": linha["timestamp"],
-            "parametros": [
-                {
-                    "nome": "disco_uso_pct",
-                    "valor": linha["disco_uso_pct"],
-                    "estado": linha["estado_disco_uso_pct"],
-                    "limite_min": linha["lim_min_disco_uso_pct"],
-                    "limite_max": linha ["lim_max_disco_uso_pct"],
-                },
-            ]
-        }
+            for componente in componentes_do_grupo:
+                if componente not in colunas_componentes:
+                    continue
 
-        rede = {
-            "nome": "rede",
-            "mac_adress": mac_geral,
-            "timestamp": linha["timestamp"],
-            "parametros": [
-                {
-                    "nome": "download_mb",
-                    "valor": linha["download_mb"],
-                    "estado": linha["estado_download_mb"],
-                    "limite_min": linha["lim_min_download_mb"],
-                    "limite_max": linha ["lim_max_download_mb"],
-                },
-                {
-                    "nome": "upload_mb",
-                    "valor": linha["upload_mb"],
-                    "estado": linha["estado_upload_mb"],
-                    "limite_min": linha["lim_min_upload_mb"],
-                    "limite_max": linha ["lim_max_upload_mb"],
-                },
-                                {
-                    "nome": "latencia_ms",
-                    "valor": linha["latencia_ms"],
-                    "estado": linha["estado_latencia_ms"],
-                    "limite_min": linha["lim_min_latencia_ms"],
-                    "limite_max": linha ["lim_max_latencia_ms"],
-                },
-                                {
-                    "nome": "packet_loss",
-                    "valor": linha["packet_loss"],
-                    "estado": linha["estado_packet_loss"],
-                    "limite_min": linha["lim_min_packet_loss"],
-                    "limite_max": linha ["lim_max_packet_loss"],
-                },
-            ]
-        }
+                if f"estado_{componente}" not in df.columns:
+                    continue
 
-        enviar_json(cpu, ram, disco, rede)
+                parametros.append({
+                    "nome": componente,
+                    "valor": linha[componente],
+                    "estado": linha[f"estado_{componente}"],
+                    "limite_min": float(linha[f"lim_min_{componente}"])
+                    if linha[f"lim_min_{componente}"] is not None
+                    else None,
 
-def enviar_json(cpu, ram, disco, rede):
-    for componente in (cpu, ram, disco, rede):
-        nome = componente["nome"]
-        mac = componente["mac_adress"]
+                    "limite_max": float(linha[f"lim_max_{componente}"])
+                    if linha[f"lim_max_{componente}"] is not None
+                    else None,
+                })
 
-        gold_prefixo = (
-            f"03-gold/componente={nome}/ano={data_ano}/mes={data_mes}/dia={data_dia}/hora={data_hora}/"
-        )
+            if not parametros:
+                continue
 
-        chave = (
-            f"{gold_prefixo}componente={nome}/{mac}_{data_hora}{data_minuto}_{nome}.json"
-        )
+            componente_json = {
+                "nome": nome_grupo,
+                "mac_address": mac_geral,
+                "timestamp": linha["timestamp"],
+                "parametros": parametros,
+            }
 
-        corpo = json.dumps(
-            componente,
-            ensure_ascii=False,
-            indent=2,
-            allow_nan=False
-        ).encode("utf-8")
+            enviar_json(componente_json)
 
-        s3.put_object(
-            Bucket=bucket,
-            Key=chave,
-            Body=corpo,
-            ContentType="application/json"
-        )
 
-        print("JSON enviado com sucesso")
+def enviar_json(componente):
+    nome = componente["nome"]
+    mac = componente["mac_address"]
+
+    gold_prefixo = (
+        f"03-gold/componente={nome}/"
+        f"ano={data_ano}/mes={data_mes}/"
+        f"dia={data_dia}/hora={data_hora}/"
+    )
+
+    chave = (
+        f"{gold_prefixo}{mac}_{data_hora}{data_minuto}"
+        f"_{nome}.json"
+    )
+
+    corpo = json.dumps(
+        componente,
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,
+        default=float,
+    ).encode("utf-8")
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=chave,
+        Body=corpo,
+        ContentType="application/json",
+    )
+
+    print(f"JSON enviado: {chave}")
+
 
 def processar_csv(dataframes_por_mac):
     for mac_geral, df in dataframes_por_mac.items():
         df = verificar_limites(mac_geral, df)
         separar_componentes(mac_geral, df)
 
+
 def carregar_csv():
     ultima_leitura = s3.list_objects_v2(Bucket=bucket, Prefix=silver_prefixo)
+    if "Contents" not in ultima_leitura:
+        print("Nenhum arquivo encontrado na Silver para esta hora.")
+        return
 
     csv_keys = []
     for obj in ultima_leitura["Contents"]:
@@ -227,5 +208,6 @@ def carregar_csv():
         df_parcial = pd.read_csv(obj["Body"])
         dataframes_por_mac[mac_geral] = df_parcial
     processar_csv(dataframes_por_mac)
+
 
 carregar_csv()
