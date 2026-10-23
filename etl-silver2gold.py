@@ -83,6 +83,26 @@ def buscar_componentes_do_embarcado(mac_geral):
     cursor.execute(comando, (mac_geral_formatado,))
     return cursor.fetchall()
 
+def classificar(valor, limite_min, limite_max):
+    if limite_min is not None and limite_max is not None:
+        if valor <= limite_min or valor >= limite_max:
+            return "Crítico"
+        if valor >= 0.7 * limite_max:
+            return "Alerta"
+        return "Normal"
+
+    if limite_min is not None:
+        return "Crítico" if valor <= limite_min else "Normal"
+
+    if limite_max is not None:
+        if valor >= limite_max:
+            return "Crítico"
+        if valor >= 0.7 * limite_max:
+            return "Alerta"
+        return "Normal"
+
+    return None
+
 def verificar_limites(mac_geral, df):
     componentes = buscar_componentes_do_embarcado(mac_geral)
 
@@ -99,15 +119,19 @@ def verificar_limites(mac_geral, df):
         limite_min = item["limite_min"]
         limite_max = item["limite_max"]
 
+        if limite_min is not None:
+            limite_min = float(limite_min)
+
+        if limite_max is not None:
+            limite_max = float(limite_max)
+
         df[f"lim_min_{componente}"] = limite_min
         df[f"lim_max_{componente}"] = limite_max
 
-        if limite_min is not None and limite_max is not None:
-            df[f"estado_{componente}"] = (df[componente] >= limite_min) & (
-                df[componente] <= limite_max
-            )
-        else:
-            df[f"estado_{componente}"] = None
+        df[f"estado_{componente}"] = df[componente].apply(
+            classificar,
+            args=(limite_min, limite_max)
+        )
 
     return df
 
@@ -134,7 +158,7 @@ def separar_componentes(mac_geral, df):
                 parametros.append({
                     "nome": componente,
                     "valor": linha[componente],
-                    "estado": linha[f"estado_{componente}"],
+                    "situacao": linha[f"estado_{componente}"],
                     "limite_min": float(linha[f"lim_min_{componente}"])
                     if linha[f"lim_min_{componente}"] is not None
                     else None,
@@ -162,9 +186,10 @@ def enviar_json(componente):
     mac = componente["mac_address"]
 
     gold_prefixo = (
-        f"03-gold/componente={nome}/"
+        f"03-gold/"
         f"ano={data_ano}/mes={data_mes}/"
         f"dia={data_dia}/hora={data_hora}/"
+        f"componente={nome}/"
     )
 
     chave = (
