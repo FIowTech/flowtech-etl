@@ -152,3 +152,93 @@
     }
 }
 ```
+
+# ETL TRACES RESULTING JSON format:
+
+```bash
+{
+  "id_trace": "trc-<uuid>",
+  "id_embarcado": "1",
+  "timestamp_inicio": "2026-11-04 18:45:10",
+  "timestamp_fim": "2026-11-04 18:45:10",
+  "startTime": 1730745910125,
+  "totalDuration": 1320,
+  "spans": [
+    {
+      "etapa": "1_IDENTIFICAR_VEICULOS",
+      "timestamp": "2026-11-04 18:45:10",
+      "startTime": 1730745910125,
+      "duration": 150,
+      "status": "OK",
+      "detalhe": "XX veículos identificados no período",
+      "extra": {
+        "cpu": {
+          "valor": 45.2,
+          "unidadeMedida": "%",
+          "status": "Normal"
+        },
+        "ram": {
+          "valor": 60.1,
+          "unidadeMedida": "%",
+          "status": "Normal"
+        },
+        "disco": {
+          "valor": 22.4,
+          "unidadeMedida": "%",
+          "status": "Normal"
+        },
+        "rede": {
+          "download": {
+            "valor": 1.1,
+            "unidadeMedida": "Mbps",
+            "status": "Normal"
+          },
+          "upload": {
+            "valor": 0.8,
+            "unidadeMedida": "Mbps",
+            "status": "Normal"
+          }
+        }
+      }
+    },
+    {
+      "etapa": "2_PERFILAMENTO_VEICULOS",
+      "timestamp": "2026-11-04 18:45:10",
+      "startTime": 1730745910125,
+      "duration": 150,
+      "status": "OK",
+      "detalhe": "Sistema de perfilamento digitalizou XX veículos no período",
+      "extra": { // same as in span-1... }
+    },
+    {
+      "etapa": "3_CLASSIFICACAO_VEICULOS",
+      "timestamp": "2026-11-04 18:46:10",
+      "startTime": 1730745910125,
+      "duration": 150,
+      "status": "FALHA",
+      "detalhe": "Sistema classificou XX veículos no perído; YY falharam",
+      "extra": { // same as in span-1... }
+    },
+    {
+      "etapa": "4_ENCAMINHAMENTO_COBRANCA",
+      "timestamp": "2026-11-04 18:47:10",
+      "startTime": 1730745910125,
+      "duration": 150,
+      "status": "OK",
+      "detalhe": "XX cobranças encaminhadas com sucesso no período",
+      "extra": { // same as in span-1... }
+    },
+    {
+      "etapa": "5_CAPTURA_METRICAS",
+      "timestamp": "2026-11-04 18:48:10",
+      "startTime": 1730745910125,
+      "duration": 150,
+      "status": "OK",
+      "detalhe": "Sistema FlowTech capturou XX métricas no período",
+      "extra": { // same as in span-1... }
+    }
+  ]
+}
+```
+
+
