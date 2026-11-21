@@ -55,6 +55,7 @@ BITS_POR_MBIT = 10**6   # divisor para converter bits/s -> Mbit/s
 COLUNAS = {
     "endereco_mac":           ("endereco_mac",           "texto", 1, None),
     "timestamp":              ("timestamp",              "texto", 1, None),
+    "ip":                     ("ip",                     "texto", 1, None),
 
     "cpu_uso_pct":            ("cpu_uso_pct",            "pct",   1, 2),
     "qtd_cpu_fisica":         ("qtd_cpu_fisica",         "int",   1, None),
