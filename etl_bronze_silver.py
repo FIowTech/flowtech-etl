@@ -47,11 +47,6 @@ BITS_POR_MBIT = 10**6   # divisor para converter bits/s -> Mbit/s
 #
 # divisor:          converte a unidade original na final (ex.: bytes / 10**9 = GB)
 # casas_decimais:   None = não arredonda (é o caso de textos e inteiros)
-#
-# OBS: se "nome_bronze" for None, a coluna NÃO existe no BRONZE: ela é derivada de
-# outras colunas e calculada mais abaixo, na função transformar(). Nesse caso,
-# só as casas decimais são usadas.
-# Ex.: "ram_uso_pct": (None, "pct", 1, 2)
 COLUNAS = {
     "endereco_mac":           ("endereco_mac",           "texto", 1, None),
     "timestamp":              ("timestamp",              "texto", 1, None),
@@ -66,13 +61,13 @@ COLUNAS = {
     "load_avg_5m":            ("load_avg_5m",            "num",   1, 2),
     "load_avg_15m":           ("load_avg_15m",           "num",   1, 2),
 
-    "ram_uso_pct":            (None,                     "pct",   1, 2),
+    "ram_uso_pct":            ("ram_uso_pct",            "pct",   1, 2),
     "ram_uso_gb":             ("ram_uso",                "num",   BYTES_POR_GB, 3),
     "ram_total_gb":           ("ram_total",              "num",   BYTES_POR_GB, 3),
-    "swap_uso_pct":           (None,                     "pct",   1, 2),
+    "swap_uso_pct":           ("swap_uso_pct",           "pct",   1, 2),
     "swap_uso_gb":            ("swap_uso",               "num",   BYTES_POR_GB, 3),
     "swap_total_gb":          ("swap_total",             "num",   BYTES_POR_GB, 3),
-    "disco_uso_pct":          (None,                     "pct",   1, 2),
+    "disco_uso_pct":          ("disco_uso_pct",          "pct",   1, 2),
     "disco_uso_gb":           ("disco_uso",              "num",   BYTES_POR_GB, 3),
     "disco_total_gb":         ("disco_total",            "num",   BYTES_POR_GB, 3),
 
@@ -85,9 +80,14 @@ COLUNAS = {
     "download_mbps":          ("download_bps",          "num",   BITS_POR_MBIT, 2),
     "upload_mbps":            ("upload_bps",            "num",   BITS_POR_MBIT, 2),
     "latencia_ms":            ("latencia_ms",            "num",   1, 2),
-    "packet_loss":            (None,                     "int",   1, None),
-    "package_loss_sent":      ("package_loss_sent",      "int",   1, None),
-    "package_loss_received":  ("package_loss_received",  "int",   1, None),
+
+    "bytes_enviados":                   ("bytes_enviados",              "int",  1,  None),
+    "bytes_recebidos":                  ("bytes_recebidos",             "int",  1,  None),
+    "pacotes_enviados":                 ("pacotes_enviados",            "int",  1,  None),
+    "pacotes_recebidos":                ("pacotes_recebidos",           "int",  1,  None),
+    "pacotes_perdidos_saindo":          ("pacotes_perdidos_saindo",     "int",  1,  None),
+    "pacotes_perdidos_chegando":        ("pacotes_perdidos_chegando",   "int",  1,  None),
+    "pacotes_perdidos_total":           (None, "int", 1, None),
 
     # cria, dinamicamente, as colunas de uso por núcleo: cpu_1, cpu_2 ... cpu_16.
     # O "**" espalha as chaves geradas aqui dentro do dicionário COLUNAS
@@ -96,11 +96,11 @@ COLUNAS = {
 
 # Colunas de percentual derivadas de outras duas: (nome, coluna de uso, coluna de total)
 # O cálculo é feito em transformar():  percentual = uso / total * 100
-PERCENTUAIS_DERIVADOS = [
-    ("ram_uso_pct", "ram_uso_gb", "ram_total_gb"),
-    ("swap_uso_pct", "swap_uso_gb", "swap_total_gb"),
-    ("disco_uso_pct", "disco_uso_gb", "disco_total_gb"),
-]
+# PERCENTUAIS_DERIVADOS = [
+#     ("ram_uso_pct", "ram_uso_gb", "ram_total_gb"),
+#     ("swap_uso_pct", "swap_uso_gb", "swap_total_gb"),
+#     ("disco_uso_pct", "disco_uso_gb", "disco_total_gb"),
+# ]
 
 # Responsável por transformar o conteúdo de um CSV do BRONZE em um dataframe no
 # formato do SILVER, aplicando o esquema definido em COLUNAS.
@@ -194,13 +194,13 @@ def transformar(corpo: bytes):
     # Calcula os percentuais derivados: uso / total * 100
     #  - se o total for 0, o percentual é 0
     #  - se o resultado passar de 100, vira nulo
-    for nome, uso, total in PERCENTUAIS_DERIVADOS:
-        pct = (out[uso] / out[total] * 100).mask(out[total] == 0, 0.0)
-        out[nome] = pct.where(pct <= 100)
+    # for nome, uso, total in PERCENTUAIS_DERIVADOS:
+    #     pct = (out[uso] / out[total] * 100).mask(out[total] == 0, 0.0)
+    #     out[nome] = pct.where(pct <= 100)
 
     # Soma os dois contadores de pacotes descartados (enviados + recebidos).
     # Se um dos dois for nulo, o resultado também é nulo
-    out["packet_loss"] = out["package_loss_sent"] + out["package_loss_received"]
+    out["pacotes_perdidos_total"] = out["pacotes_perdidos_saindo"] + out["pacotes_perdidos_chegando"]
 
     # Arredonda cada coluna para o número de casas definido em COLUNAS. Colunas com
     # casas_decimais None (textos e inteiros) não são arredondadas
