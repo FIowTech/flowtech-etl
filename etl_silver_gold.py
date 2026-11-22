@@ -2,39 +2,59 @@ import io
 import json
 import logging
 import os
+from datetime import datetime
 from urllib.parse import unquote_plus
-
+ 
 import boto3
+from botocore.exceptions import ClientError
 import mysql.connector
 import pandas as pd
-
+ 
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover
     load_dotenv = None
-
+ 
 # === VARIÁVEIS GLOBAIS === #
 #
 # Carrega variáveis do .env no ambiente local. Na Lambda, as variáveis já vêm
 # do próprio ambiente de execução.
 if load_dotenv:
     load_dotenv()
-
+ 
 # Define INFO como nível mínimo de log. A Lambda envia os logs para o CloudWatch.
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
+ 
 # Cliente S3 global para reaproveitar entre invocações (cold start).
 s3 = boto3.client("s3")
-
+ 
 # Conexão com banco criada sob demanda e reaproveitada enquanto possível.
 conexao = None
-
+ 
 # Prefixos usados para validar origem (SILVER) e montar destino (GOLD).
 PREFIXO_SILVER = "02-silver/metricas/"
 PREFIXO_GOLD = "03-gold/metricas/"
 DELIMITADOR = ";"
-
+ 
+# === ALERTAS (episódios) === #
+#
+# Um único arquivo por empresa guarda o estado de cada par (embarcado, recurso):
+#   03-gold/alertas/empresa=<id_empresa>/alertas.json
+# O dashboard faz 1 GET nesse arquivo e filtra status == "aberto".
+PREFIXO_ALERTAS = "03-gold/alertas/"
+RECURSOS = ("cpu", "ram", "swap", "disco", "rede")
+FORMATO_TS = "%Y-%m-%d %H:%M:%S"
+ 
+# Anti-ruído: quantos snapshots seguidos (1 a cada ~2 s) são necessários para
+# abrir e para fechar um alerta.
+MIN_SEQ_ABRIR = 5
+MIN_SEQ_FECHAR = 5
+ 
+# A rede só é medida (speedtest) ~1 vez a cada 40 s; snapshots sem medição são
+# ignorados nos alertas, então aqui a contagem é de MEDIÇÕES, não de snapshots.
+MIN_SEQ_REDE = 2
+ 
 # Mapeia nome de componente no banco para chave interna usada na aplicação.
 MAPA_COMPONENTE_DB_METRICA = {
     "cpu_uso": "cpu.uso",
@@ -46,7 +66,7 @@ MAPA_COMPONENTE_DB_METRICA = {
     "rede_upload": "rede.upload",
     "rede_latencia": "rede.latencia",
 }
-
+ 
 # Query única: busca contexto do embarcado e limites ativos.
 # Usa placeholder %s (prepared statement) e normaliza MAC no WHERE.
 QUERY_CONTEXTO_LIMITES = """
@@ -67,8 +87,8 @@ LEFT JOIN componente c
 WHERE REPLACE(REPLACE(UPPER(e.endereco_mac), ':', ''), '-', '') = %s
 ;
 """
-
-
+ 
+ 
 # Cria/recria conexão com banco quando necessário.
 def get_conexao():
     global conexao
@@ -80,8 +100,8 @@ def get_conexao():
             database=os.getenv("DB_NAME"),
         )
     return conexao
-
-
+ 
+ 
 # Conversão segura para float (com valor padrão quando inválido/nulo).
 def to_float(valor, padrao=0.0):
     if pd.isna(valor):
@@ -90,8 +110,8 @@ def to_float(valor, padrao=0.0):
         return float(valor)
     except (TypeError, ValueError):
         return padrao
-
-
+ 
+ 
 # Conversão segura para inteiro (com valor padrão quando inválido/nulo).
 def to_int(valor, padrao=0):
     if pd.isna(valor):
@@ -100,35 +120,35 @@ def to_int(valor, padrao=0):
         return int(valor)
     except (TypeError, ValueError):
         return padrao
-
-
+ 
+ 
 # Converte para texto removendo espaços nas pontas.
 def to_texto(valor, padrao=""):
     if pd.isna(valor):
         return padrao
     return str(valor).strip()
-
-
+ 
+ 
 # Formata MAC para padrão AA:BB:CC:DD:EE:FF quando possível.
 def normalizar_mac(mac):
     bruto = "".join(ch for ch in str(mac or "") if ch.isalnum()).upper()
     if len(bruto) == 12:
         return ":".join(bruto[i:i + 2] for i in range(0, 12, 2))
     return str(mac or "").strip()
-
-
+ 
+ 
 # Remove separadores e padroniza MAC para cache/consulta.
 def normalizar_mac_limpo(mac):
     return "".join(ch for ch in str(mac or "") if ch.isalnum()).upper()
-
-
+ 
+ 
 # Classifica a métrica conforme limites definidos.
 # Sem limite configurado: situação "Normal".
 def classificar(valor, limite_min, limite_max):
     # Regra pedida: sem limite => Normal
     if valor is None:
         return "Normal"
-
+ 
     if limite_min is not None and valor <= limite_min:
         return "Crítico"
     if limite_max is not None:
@@ -137,8 +157,8 @@ def classificar(valor, limite_min, limite_max):
         if valor >= 0.7 * limite_max:
             return "Alerta"
     return "Normal"
-
-
+ 
+ 
 # Define a situação final do componente pela pior situação entre suas métricas.
 # Prioridade: Crítico > Alerta > Normal.
 def situacao_componente(situacoes_metricas):
@@ -147,30 +167,30 @@ def situacao_componente(situacoes_metricas):
     if any(s == "Alerta" for s in situacoes_metricas):
         return "Alerta"
     return "Normal"
-
-
+ 
+ 
 # Busca no banco o contexto do embarcado (empresa/id) e limites por métrica.
 # Retorna (contexto, limites) ou (None, None) quando MAC não encontrado.
 def buscar_contexto_e_limites(endereco_mac):
     mac_limpo = normalizar_mac_limpo(endereco_mac)
     if not mac_limpo:
         return None, None
-
+ 
     cursor = get_conexao().cursor(dictionary=True)
     cursor.execute(QUERY_CONTEXTO_LIMITES, (mac_limpo,))
     linhas = cursor.fetchall()
     cursor.close()
-
+ 
     if not linhas:
         return None, None
-
+ 
     primeira = linhas[0]
     contexto = {
         "id_empresa": to_int(primeira.get("id_empresa")),
         "id_embarcado": to_int(primeira.get("id_embarcado")),
         "endereco_mac": to_texto(primeira.get("endereco_mac"), normalizar_mac(mac_limpo)),
     }
-
+ 
     limites = {}
     for linha in linhas:
         nome_componente = linha.get("componente")
@@ -181,10 +201,10 @@ def buscar_contexto_e_limites(endereco_mac):
             "limite_min": None if linha.get("limite_min") is None else float(linha["limite_min"]),
             "limite_max": None if linha.get("limite_max") is None else float(linha["limite_max"]),
         }
-
+ 
     return contexto, limites
-
-
+ 
+ 
 # Monta a estrutura base de uma métrica no JSON final.
 def montar_metrica(nome, unidade, valor, total, limite_min, limite_max):
     valor_classificacao = valor if valor is not None else 0.0
@@ -199,43 +219,43 @@ def montar_metrica(nome, unidade, valor, total, limite_min, limite_max):
         "limite_max": 0.0 if limite_max is None else float(limite_max),
         "limite_min": 0.0 if limite_min is None else float(limite_min),
     }
-
-
+ 
+ 
 # Calcula percentual a partir de valor/total, protegendo total nulo/zero.
 def calcular_pct(valor, total):
     if total is None or total <= 0:
         return 0.0
     return (float(valor) / float(total)) * 100.0
-
-
+ 
+ 
 # Monta o payload no formato exigido pelo AGENTS.md a partir de uma linha SILVER.
 def montar_payload(linha, contexto, limites):
     def lim(chave):
         item = limites.get(chave, {})
         return item.get("limite_min"), item.get("limite_max")
-
+ 
     # Métricas base lidas da linha SILVER
     cpu_uso = to_float(linha.get("cpu_uso_pct"))
     cpu_total = to_float(linha.get("cpu_freq_total_mhz"))
     cpu_freq = to_float(linha.get("cpu_freq_mhz"))
     cpu_freq_pct = calcular_pct(cpu_freq, cpu_total)
-
+ 
     ram_uso_pct = to_float(linha.get("ram_uso_pct"))
     ram_uso = to_float(linha.get("ram_uso_gb"))
     ram_total = to_float(linha.get("ram_total_gb"))
-
+ 
     swap_uso_pct = to_float(linha.get("swap_uso_pct"))
     swap_uso = to_float(linha.get("swap_uso_gb"))
     swap_total = to_float(linha.get("swap_total_gb"))
-
+ 
     disco_uso_pct = to_float(linha.get("disco_uso_pct"))
     disco_uso = to_float(linha.get("disco_uso_gb"))
     disco_total = to_float(linha.get("disco_total_gb"))
-
+ 
     download = to_float(linha.get("download_mbps"))
     upload = to_float(linha.get("upload_mbps"))
     latencia = to_float(linha.get("latencia_ms"))
-
+ 
     lim_cpu_uso_min, lim_cpu_uso_max = lim("cpu.uso")
     lim_cpu_freq_min, lim_cpu_freq_max = lim("cpu.freq")
     lim_ram_uso_min, lim_ram_uso_max = lim("ram.uso")
@@ -244,41 +264,41 @@ def montar_payload(linha, contexto, limites):
     lim_rede_download_min, lim_rede_download_max = lim("rede.download")
     lim_rede_upload_min, lim_rede_upload_max = lim("rede.upload")
     lim_rede_latencia_min, lim_rede_latencia_max = lim("rede.latencia")
-
+ 
     # Lista de uso por núcleo (cpu_1 ... cpu_16), quando disponíveis.
     cpu_por_nucleo = []
     for i in range(1, 17):
         col = f"cpu_{i}"
         if col in linha and not pd.isna(linha[col]):
             cpu_por_nucleo.append(to_float(linha[col]))
-
+ 
     # CPU: uso já é percentual; valor e valor_pct ficam iguais.
     metrica_cpu_uso = montar_metrica("Uso", "%", cpu_uso, None, lim_cpu_uso_min, lim_cpu_uso_max)
     metrica_cpu_uso["valor_pct"] = float(cpu_uso)
     metrica_cpu_uso["por_nucleo"] = cpu_por_nucleo
-
+ 
     # CPU frequência: valor em MHz e valor_pct calculado por valor/total.
     metrica_cpu_freq = montar_metrica("Frequência", "MHz", cpu_freq, cpu_total, lim_cpu_freq_min, lim_cpu_freq_max)
     metrica_cpu_freq["valor_pct"] = float(cpu_freq_pct)
-
+ 
     # RAM/SWAP/Disco: valor em GB e valor_pct com o uso em percentual.
     metrica_ram_uso = montar_metrica("Uso", "GB", ram_uso, ram_total, lim_ram_uso_min, lim_ram_uso_max)
     metrica_ram_uso["valor_pct"] = float(ram_uso_pct)
     metrica_ram_uso["situacao"] = classificar(ram_uso_pct, lim_ram_uso_min, lim_ram_uso_max)
-
+ 
     metrica_swap_uso = montar_metrica("Uso", "GB", swap_uso, swap_total, lim_swap_uso_min, lim_swap_uso_max)
     metrica_swap_uso["valor_pct"] = float(swap_uso_pct)
     metrica_swap_uso["situacao"] = classificar(swap_uso_pct, lim_swap_uso_min, lim_swap_uso_max)
-
+ 
     metrica_disco_uso = montar_metrica("Uso", "GB", disco_uso, disco_total, lim_disco_uso_min, lim_disco_uso_max)
     metrica_disco_uso["valor_pct"] = float(disco_uso_pct)
     metrica_disco_uso["situacao"] = classificar(disco_uso_pct, lim_disco_uso_min, lim_disco_uso_max)
-
+ 
     # Rede: não usa valor_pct.
     metrica_rede_download = montar_metrica("Download", "Mbps", download, None, lim_rede_download_min, lim_rede_download_max)
     metrica_rede_upload = montar_metrica("Upload", "Mbps", upload, None, lim_rede_upload_min, lim_rede_upload_max)
     metrica_rede_latencia = montar_metrica("Latência", "Ms", latencia, None, lim_rede_latencia_min, lim_rede_latencia_max)
-
+ 
     # Situação de cada componente calculada pelas situações das métricas internas.
     situacao_cpu = situacao_componente([metrica_cpu_uso["situacao"], metrica_cpu_freq["situacao"]])
     situacao_ram = situacao_componente([metrica_ram_uso["situacao"]])
@@ -287,7 +307,7 @@ def montar_payload(linha, contexto, limites):
     situacao_rede = situacao_componente(
         [metrica_rede_download["situacao"], metrica_rede_upload["situacao"], metrica_rede_latencia["situacao"]]
     )
-
+ 
     # Estrutura final do documento JSON por snapshot.
     return {
         "ip": to_texto(linha.get("ip")),
@@ -366,47 +386,151 @@ def montar_payload(linha, contexto, limites):
             },
         },
     }
-
-
+ 
+ 
+# Chave do arquivo de alertas de uma empresa.
+def chave_alertas(id_empresa):
+    return f"{PREFIXO_ALERTAS}empresa={id_empresa}/alertas.json"
+ 
+ 
+# Lê o estado atual dos alertas da empresa (dict vazio se o arquivo não existe).
+def ler_alertas(bucket, id_empresa):
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=chave_alertas(id_empresa))
+    except ClientError as erro:
+        if erro.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return {}
+        raise
+    return json.loads(obj["Body"].read())
+ 
+ 
+# Diferença em minutos entre dois timestamps "YYYY-MM-DD HH:MM:SS".
+def minutos_entre(inicio, fim):
+    delta = datetime.strptime(fim, FORMATO_TS) - datetime.strptime(inicio, FORMATO_TS)
+    return max(int(delta.total_seconds() // 60), 0)
+ 
+ 
+# Quantos snapshots (ou medições, no caso da rede) abrem/fecham o alerta.
+def limites_seq(recurso):
+    if recurso == "rede":
+        return MIN_SEQ_REDE, MIN_SEQ_REDE
+    return MIN_SEQ_ABRIR, MIN_SEQ_FECHAR
+ 
+ 
+# Atualiza o estado de UM alerta (embarcado + recurso) com UM snapshot.
+# Abre depois de MIN_SEQ_ABRIR snapshots seguidos fora do Normal e fecha depois
+# de MIN_SEQ_FECHAR snapshots seguidos Normais. Retorna o próprio dict `a`.
+def aplicar_snapshot(a, payload, recurso):
+    ts = payload["timestamp"]
+    situacao = payload["componentes"][recurso]["situacao"]
+ 
+    a.setdefault("seq_fora", 0)
+    a.setdefault("seq_normal", 0)
+    a["id_embarcado"] = payload["id_embarcado"]
+    a["endereco_mac"] = payload["endereco_mac"]
+    a["recurso"] = recurso
+ 
+    # Sem speedtest neste snapshot não há informação nova: não abre, não fecha
+    # e não conta (o gold grava 0.0, que seria lido como "Normal").
+    if recurso == "rede" and not payload.get("_rede_medida", True):
+        return a
+ 
+    min_abrir, min_fechar = limites_seq(recurso)
+ 
+    if situacao != "Normal":
+        a["seq_normal"] = 0
+        if a.get("status") == "aberto":
+            a["estado"] = situacao
+            a["ultima_leitura"] = ts
+        else:
+            if a["seq_fora"] == 0:
+                a["inicio_candidato"] = ts
+            a["seq_fora"] += 1
+            if a["seq_fora"] >= min_abrir:
+                a.update(
+                    status="aberto",
+                    estado=situacao,
+                    inicio=a["inicio_candidato"],
+                    fim=None,
+                    ultima_leitura=ts,
+                )
+    else:
+        a["seq_fora"] = 0
+        if a.get("status") == "aberto":
+            a["seq_normal"] += 1
+            if a["seq_normal"] >= min_fechar:
+                a.update(status="fechado", fim=a["ultima_leitura"], seq_normal=0)
+ 
+    if a.get("inicio"):
+        a["duracao_min"] = minutos_entre(a["inicio"], a.get("fim") or a["ultima_leitura"])
+    return a
+ 
+ 
+# Aplica todos os snapshots do arquivo (em ordem de tempo) e regrava o estado.
+def atualizar_alertas(bucket, payloads):
+    por_empresa = {}
+    for p in sorted(payloads, key=lambda p: p["timestamp"]):
+        por_empresa.setdefault(p["id_empresa"], []).append(p)
+ 
+    for id_empresa, lista in por_empresa.items():
+        estado = ler_alertas(bucket, id_empresa)
+        for p in lista:
+            for recurso in RECURSOS:
+                chave = f"{p['id_embarcado']}:{recurso}"
+                aplicar_snapshot(estado.setdefault(chave, {}), p, recurso)
+        s3.put_object(
+            Bucket=bucket,
+            Key=chave_alertas(id_empresa),
+            Body=json.dumps(estado, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+        )
+ 
+ 
 # Monta a chave GOLD preservando o caminho relativo e trocando .csv por .jsonl.
 def chave_gold(chave_silver):
     relativa = chave_silver[len(PREFIXO_SILVER):]
     if relativa.lower().endswith(".csv"):
         relativa = relativa[:-4] + ".jsonl"
     return PREFIXO_GOLD + relativa
-
-
+ 
+ 
 # Processa um arquivo SILVER: lê CSV, monta JSONL e grava no prefixo GOLD.
 def processar_objeto(bucket, chave):
     obj = s3.get_object(Bucket=bucket, Key=chave)
     corpo = obj["Body"].read()
     df = pd.read_csv(io.BytesIO(corpo), sep=DELIMITADOR)
-
+ 
     linhas_jsonl = []
+    payloads = []
     total_linhas = len(df)
     linhas_validas = 0
     linhas_ignoradas = 0
     cache_contexto = {}
-
+ 
     # Processa linha a linha para montar os snapshots.
     for _, linha in df.iterrows():
         mac_linha = linha.get("endereco_mac")
         mac_consulta = normalizar_mac_limpo(mac_linha)
-
+ 
         # Evita consultar o mesmo MAC várias vezes no mesmo arquivo.
         if mac_consulta not in cache_contexto:
             cache_contexto[mac_consulta] = buscar_contexto_e_limites(mac_consulta)
-
+ 
         contexto, limites = cache_contexto[mac_consulta]
         if contexto is None:
             linhas_ignoradas += 1
             logger.warning("MAC não encontrado/ativo no banco. Ignorando linha. mac=%s origem=%s", mac_linha, chave)
             continue
-
+ 
         payload = montar_payload(linha, contexto, limites or {})
         linhas_jsonl.append(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+        rede_medida = any(
+            not pd.isna(linha.get(c)) for c in ("download_mbps", "upload_mbps", "latencia_ms")
+        )
+        # Cópia só para os alertas: o "_rede_medida" não entra no JSON do gold.
+        payloads.append({**payload, "_rede_medida": rede_medida})
         linhas_validas += 1
-
+ 
     # Metadados de execução por arquivo processado.
     stats = {
         "origem": chave,
@@ -414,11 +538,11 @@ def processar_objeto(bucket, chave):
         "linhas_validas": linhas_validas,
         "linhas_ignoradas": linhas_ignoradas,
     }
-
+ 
     if not linhas_jsonl:
         logger.warning("Nenhuma linha válida para GOLD: %s", json.dumps(stats, ensure_ascii=False))
         return {**stats, "status": "sem_registros_validos"}
-
+ 
     # Grava um único arquivo JSONL por arquivo CSV de origem.
     destino = chave_gold(chave)
     s3.put_object(
@@ -427,34 +551,42 @@ def processar_objeto(bucket, chave):
         Body=("\n".join(linhas_jsonl) + "\n").encode("utf-8"),
         ContentType="application/x-ndjson",
     )
+    # Falha nos alertas não pode derrubar o gold que já foi gravado.
+    try:
+        atualizar_alertas(bucket, payloads)
+        stats["alertas"] = "ok"
+    except Exception:  # pragma: no cover
+        logger.exception("Erro ao atualizar alertas: %s", chave)
+        stats["alertas"] = "erro"
+ 
     logger.info("ETL SILVER->GOLD concluída: %s", json.dumps({**stats, "destino": destino}, ensure_ascii=False))
     return {**stats, "destino": destino, "status": "ok"}
-
-
+ 
+ 
 # Ponto de entrada da Lambda. Processa cada objeto vindo no evento S3.
 def lambda_handler(event, context):
     resultados = []
     for registro in event.get("Records", []):
         bucket = registro["s3"]["bucket"]["name"]
         chave = unquote_plus(registro["s3"]["object"]["key"])
-
+ 
         if not (chave.startswith(PREFIXO_SILVER) and chave.lower().endswith(".csv")):
             logger.info("Ignorando objeto fora de %s*.csv: %s", PREFIXO_SILVER, chave)
             continue
-
+ 
         try:
             resultados.append(processar_objeto(bucket, chave))
         except Exception as erro:  # pragma: no cover
             logger.exception("Erro ao processar %s", chave)
             resultados.append({"origem": chave, "status": "erro", "mensagem": str(erro)})
-
+ 
     return {"processados": resultados}
-
-
+ 
+ 
 # Execução local para teste: simula evento da Lambda com bucket e chave.
 if __name__ == "__main__":
     import sys
-
+ 
     evento = {
         "Records": [
             {
@@ -466,3 +598,4 @@ if __name__ == "__main__":
         ]
     }
     print(json.dumps(lambda_handler(evento, None), ensure_ascii=False, indent=2))
+ 
