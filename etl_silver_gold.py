@@ -7,6 +7,8 @@ from urllib.parse import unquote_plus
 import boto3
 import mysql.connector
 import pandas as pd
+from datetime import datetime
+from botocore.exceptions import ClientError
 
 try:
     from dotenv import load_dotenv
@@ -33,7 +35,10 @@ conexao = None
 # Prefixos usados para validar origem (SILVER) e montar destino (GOLD).
 PREFIXO_SILVER = "02-silver/metricas/"
 PREFIXO_GOLD = "03-gold/metricas/"
-DELIMITADOR = ";"
+PREFIXO_FALHAS = "03-gold/falhas/"
+PREFIXO_ESTADO = "03-gold/_estado/"
+LIMITE_CAPTURAS_FALHA = 2
+DELIMITADOR = ","
 
 # Mapeia nome de componente no banco para chave interna usada na aplicação.
 MAPA_COMPONENTE_DB_METRICA = {
@@ -383,6 +388,7 @@ def processar_objeto(bucket, chave):
     df = pd.read_csv(io.BytesIO(corpo), sep=DELIMITADOR)
 
     linhas_jsonl = []
+    payloads = []
     total_linhas = len(df)
     linhas_validas = 0
     linhas_ignoradas = 0
@@ -404,6 +410,7 @@ def processar_objeto(bucket, chave):
             continue
 
         payload = montar_payload(linha, contexto, limites or {})
+        payloads.append(payload)
         linhas_jsonl.append(json.dumps(payload, ensure_ascii=False, allow_nan=False))
         linhas_validas += 1
 
@@ -427,8 +434,17 @@ def processar_objeto(bucket, chave):
         Body=("\n".join(linhas_jsonl) + "\n").encode("utf-8"),
         ContentType="application/x-ndjson",
     )
-    logger.info("ETL SILVER->GOLD concluída: %s", json.dumps({**stats, "destino": destino}, ensure_ascii=False))
-    return {**stats, "destino": destino, "status": "ok"}
+
+    # Avalia e grava as falhas usando os payloads já prontos na memória.
+    falhas_atualizadas = []
+    try:
+        falhas_atualizadas = avaliar_e_gravar_falhas_s3(bucket, payloads)
+    except Exception:
+        logger.exception("Erro ao avaliar falhas para %s (métricas GOLD já salvas)", chave)
+
+    resumo = {**stats, "destino": destino, "falhas": falhas_atualizadas}
+    logger.info("ETL SILVER->GOLD concluída: %s", json.dumps(resumo, ensure_ascii=False))
+    return {**resumo, "status": "ok"}
 
 
 # Ponto de entrada da Lambda. Processa cada objeto vindo no evento S3.
@@ -449,6 +465,246 @@ def lambda_handler(event, context):
             resultados.append({"origem": chave, "status": "erro", "mensagem": str(erro)})
 
     return {"processados": resultados}
+
+def parse_timestamp(ts_str):
+    return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).replace(tzinfo=None)
+
+
+def ler_estado_s3(bucket, mac_limpo):
+    chave = f"{PREFIXO_ESTADO}{mac_limpo}.json"
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=chave)
+        estado = json.loads(resp["Body"].read().decode("utf-8"))
+        return estado, resp["ETag"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return {"ultimo_timestamp": None, "componentes": {}}, None
+        raise
+
+
+def salvar_estado_s3(bucket, mac_limpo, estado, etag):
+    chave = f"{PREFIXO_ESTADO}{mac_limpo}.json"
+    kwargs = {
+        "Bucket": bucket,
+        "Key": chave,
+        "Body": json.dumps(estado, ensure_ascii=False).encode("utf-8"),
+        "ContentType": "application/json",
+    }
+    if etag:
+        kwargs["IfMatch"] = etag
+    else:
+        kwargs["IfNoneMatch"] = "*"
+
+    s3.put_object(**kwargs)
+
+def chave_falha_s3(mac_limpo, componente, dt_inicio):
+    """
+    Constrói e retorna o caminho completo (Key) onde o arquivo JSON da falha
+    será salvo ou atualizado dentro do bucket S3.
+
+    Parâmetros:
+        mac_limpo (str): Endereço MAC sem dois-pontos ou hífens (ex: 'AABBCCDDEEFF').
+        componente (str): Nome da chave do componente que falhou (ex: 'ram', 'cpu').
+        dt_inicio (datetime): Data e hora exatas da 1ª captura crítica que iniciou a falha.
+    """
+    # Define a estrutura de diretórios particionada por ano/mês/dia/hora.
+    # IMPORTANTE: Usa sempre a data/hora de INÍCIO da falha (dt_inicio) e não a hora atual.
+    # Isso garante que, se uma falha começar às 13:55 e terminar às 14:10, a atualização
+    # final (fechamento) sobrescreva exatamente o mesmo arquivo na pasta da hora 13,
+    # evitando a criação de arquivos duplicados na pasta da hora 14.
+    pasta_hora = dt_inicio.strftime("%Y/%m/%d/%H")
+
+    # Formata a data/hora de início em uma string compacta sem caracteres especiais
+    # (ex: '20261122T134500') para compor um nome de arquivo único e seguro para URLs/S3.
+    ts_slug = dt_inicio.strftime("%H%M")
+
+    # Concatena o prefixo global ('03-gold/falhas/'), a pasta da hora e o nome padronizado.
+    # Exemplo final: '03-gold/falhas/2026/11/22/13/AABBCCDDEEFF_ram_20261122T134500_falha.json'
+    return f"{PREFIXO_FALHAS}{pasta_hora}/{mac_limpo}_{componente}_{ts_slug}_falha.json"
+
+def montar_doc_falha(payload, nome_comp, inicio_iso, fim_iso, contagem, em_andamento):
+    """
+    Monta o dicionário Python que representa a estrutura final do JSON da falha
+    que será gravado na camada GOLD do S3.
+
+    Parâmetros:
+        payload (dict): Objeto completo da captura atual (usado para extrair IDs de contexto).
+        nome_comp (str): Nome do componente em falha (ex: 'ram', 'disco').
+        inicio_iso (str): Timestamp ISO-8601 da 1ª captura crítica da sequência.
+        fim_iso (str | None): Timestamp ISO-8601 da captura que normalizou o sistema,
+                              ou None caso a falha ainda esteja ocorrendo.
+        contagem (int): Total de capturas consecutivas registradas em estado 'Crítico'.
+        em_andamento (bool): True se o componente permanece crítico; False se já normalizou.
+    """
+    return {
+        "id_empresa": payload["id_empresa"],
+        "id_embarcado": payload["id_embarcado"],
+        "endereco_mac": payload["endereco_mac"],
+        "componente": nome_comp,
+        "em_andamento": em_andamento,
+        "data_inicio": inicio_iso,
+        "data_fim": fim_iso,
+        "capturas_consecutivas": contagem,
+    }
+
+
+def avaliar_e_gravar_falhas_s3(bucket, payloads):
+    """
+    Avalia uma lista de capturas (snapshots) de um embarcado, atualiza a máquina de estados
+    no S3 (contagem de capturas críticas seguidas) e cria/atualiza os arquivos JSON de falha
+    quando um componente atinge ou encerra uma sequência de >= LIMITE_CAPTURAS_FALHA (10).
+
+    Parâmetros:
+        bucket (str): Nome do bucket S3 onde estão os dados GOLD e o estado.
+        payloads (list[dict]): Lista de dicionários gerados por montar_payload().
+
+    Retorno:
+        list[str]: Lista com as chaves (Keys) dos arquivos de falha criados/atualizados no S3.
+    """
+    # Guarda de segurança: se o CSV de origem não gerou nenhum payload válido, encerra imediatamente.
+    if not payloads:
+        return []
+
+    # Ordena os payloads cronologicamente pelo campo 'timestamp'.
+    # Mesmo que um arquivo CSV contenha múltiplas capturas fora de ordem, a máquina de estados
+    # precisa processá-las estritamente do passado para o futuro para não quebrar a contagem.
+    payloads_ordenados = sorted(payloads, key=lambda p: p["timestamp"])
+
+    # Extrai e limpa o MAC da primeira captura (assume-se que todo o lote pertence ao mesmo dispositivo).
+    mac_limpo = normalizar_mac_limpo(payloads_ordenados[0]["endereco_mac"])
+
+    # Lista que armazenará os caminhos S3 das falhas gravadas nesta execução (para logs/retorno).
+    falhas_atualizadas = []
+
+    # Loop de controle de concorrência otimista (Optimistic Locking) com até 5 tentativas.
+    # Como a Lambda é orientada a eventos, duas instâncias podem executar ao mesmo tempo
+    # para o mesmo dispositivo. Se houver colisão na escrita do arquivo de estado, o loop
+    # descarta o processamento local, relê o estado atualizado do S3 e reprocessa o lote.
+    for tentativa in range(5):
+        # 1. Lê o arquivo de estado atual do dispositivo ('03-gold/_estado/{MAC}.json')
+        # junto com seu 'ETag' (hash de versão gerado pelo próprio S3).
+        # Se o dispositivo nunca enviou dados antes, retorna um estado zerado e etag=None.
+        estado, etag = ler_estado_s3(bucket, mac_limpo)
+
+        # Dicionário temporário indexado pela chave S3 de destino -> documento da falha.
+        # Usar um dict em vez de uma lista evita fazer múltiplos s3.put_object desnecessários
+        # caso um mesmo lote tenha, por exemplo, as capturas 10, 11 e 12 juntas (grava só a versão final do lote).
+        gravacoes_pendentes = {}
+
+        # Converte o último timestamp já processado anteriormente para objeto datetime (se existir).
+        ultimo_ts_salvo = (
+            parse_timestamp(estado["ultimo_timestamp"])
+            if estado.get("ultimo_timestamp")
+            else None
+        )
+
+        # 2. Itera sobre cada snapshot (captura) do lote em ordem cronológica.
+        for payload in payloads_ordenados:
+            ts_atual = parse_timestamp(payload["timestamp"])
+
+            # Proteção contra idempotência e arquivos atrasados:
+            # Se esta captura tem timestamp anterior ou igual ao último já processado, ignora
+            # para não contar a mesma captura duas vezes nem regredir o estado.
+            if ultimo_ts_salvo and ts_atual <= ultimo_ts_salvo:
+                continue
+
+            # 3. Avalia individualmente cada componente monitorado ('cpu', 'ram', 'swap', 'disco', 'rede').
+            for nome_comp, dados_comp in payload["componentes"].items():
+                situacao = dados_comp["situacao"]  # Valores possíveis: 'Normal', 'Alerta' ou 'Crítico'
+
+                # Recupera o estado acumulado deste componente ou inicializa caso seja a primeira vez.
+                # 'contagem': quantas vezes seguidas veio 'Crítico' ou 'Alerta'.
+                # 'inicio': timestamp ISO de quando essa sequência crítica começou.
+                comp_estado = estado["componentes"].setdefault(
+                    nome_comp, {"contagem": 0, "inicio": None}
+                )
+
+                if situacao in ("Alerta", "Crítico"):
+                    # Se o contador estava zerado, esta é a 1ª captura crítica da nova sequência;
+                    # portanto, registramos este instante como o início potencial de uma falha.
+                    if comp_estado["contagem"] == 0:
+                        comp_estado["inicio"] = ts_atual.isoformat()
+
+                    # Incrementa o contador de capturas em alerta consecutivas.
+                    comp_estado["contagem"] += 1
+
+                    # Verifica se atingiu o limiar de falha (ex: 10 capturas seguidas).
+                    # Nota: Usamos '>=' para que:
+                    # - Na 10ª captura: crie o arquivo de falha no S3 pela primeira vez.
+                    # - Na 11ª, 12ª... captura: atualize o contador no mesmo arquivo enquanto durar.
+                    if comp_estado["contagem"] >= LIMITE_CAPTURAS_FALHA:
+                        dt_inicio = parse_timestamp(comp_estado["inicio"])
+                        destino = chave_falha_s3(mac_limpo, nome_comp, dt_inicio)
+                        doc = montar_doc_falha(
+                            payload,
+                            nome_comp,
+                            comp_estado["inicio"],
+                            None,                     # data_fim ainda é nula porque não normalizou
+                            comp_estado["contagem"],
+                            em_andamento=True,        # Sinaliza que a falha continua ativa
+                        )
+                        # Agenda a gravação/atualização deste arquivo para depois que o estado for salvo.
+                        gravacoes_pendentes[destino] = doc
+                else:
+                    # O componente veio 'Normal' ou 'Alerta', quebrando a sequência crítica.
+                    # Verifica se havia uma falha consolidada em aberto (>= 10 capturas críticas).
+                    if comp_estado["contagem"] >= LIMITE_CAPTURAS_FALHA and comp_estado["inicio"]:
+                        dt_inicio = parse_timestamp(comp_estado["inicio"])
+                        destino = chave_falha_s3(mac_limpo, nome_comp, dt_inicio)
+                        doc = montar_doc_falha(
+                            payload,
+                            nome_comp,
+                            comp_estado["inicio"],
+                            ts_atual.isoformat(),     # Preenche data_fim com o momento exato da normalização
+                            comp_estado["contagem"],  # Mantém a contagem total de críticas que ocorreram
+                            em_andamento=False,       # Sinaliza que o incidente foi encerrado
+                        )
+                        # Agenda a sobrescrita final do arquivo da falha no S3.
+                        gravacoes_pendentes[destino] = doc
+
+                    # Independentemente de ter virado falha ou ter parado antes de 10 (ex: parou na 4ª),
+                    # zera o contador e limpa o início para aguardar uma eventual nova sequência futura.
+                    comp_estado["contagem"] = 0
+                    comp_estado["inicio"] = None
+
+            # Atualiza o ponteiro temporal após processar todos os componentes desta captura.
+            ultimo_ts_salvo = ts_atual
+            estado["ultimo_timestamp"] = ts_atual.isoformat()
+
+        # 4. Fase de persistência (Commit no S3).
+        try:
+            # Primeiro tenta salvar o novo estado usando o ETag lido no início (IfMatch / IfNoneMatch).
+            # Se outra Lambda modificou o arquivo nesse meio-tempo, o S3 rejeita esta escrita
+            # e lança ClientError antes que qualquer arquivo de falha incorreto seja gravado.
+            salvar_estado_s3(bucket, mac_limpo, estado, etag)
+
+            # Com o estado garantido e livre de conflitos, grava efetivamente todos os arquivos
+            # de falha novos ou atualizados na camada GOLD ('03-gold/falhas/...').
+            for destino, doc_falha in gravacoes_pendentes.items():
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=destino,
+                    Body=json.dumps(doc_falha, ensure_ascii=False, indent=2).encode("utf-8"),
+                    ContentType="application/json",
+                )
+                falhas_atualizadas.append(destino)
+
+            # Tudo persistido com sucesso; sai do loop de retry.
+            break
+
+        except ClientError as e:
+            # Captura especificamente erros de concorrência condicional do S3:
+            # - PreconditionFailed (HTTP 412): o ETag mudou (outra execução salvou antes).
+            # - ConditionalRequestConflict (HTTP 409): conflito simultâneo na criação inicial.
+            codigo_erro = e.response["Error"]["Code"]
+            if codigo_erro in ("PreconditionFailed", "ConditionalRequestConflict") and tentativa < 4:
+                # Volta ao início do 'for tentativa' para reler o estado mais recente e tentar de novo.
+                continue
+
+            # Se for qualquer outro erro (ex: AccessDenied) ou se esgotou as 5 tentativas, propaga a exceção.
+            raise
+
+    return falhas_atualizadas
 
 
 # Execução local para teste: simula evento da Lambda com bucket e chave.
