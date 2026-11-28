@@ -515,7 +515,7 @@ def chave_falha_s3(mac_limpo, componente, dt_inicio, em_andamento=True):
     return f"{PREFIXO_FALHAS}{subpasta_status}/{pasta_hora}/{mac_limpo}_{componente}_{ts_slug}_falha.json"
 
 
-def montar_doc_falha(payload, nome_comp, inicio_iso, fim_iso, contagem, em_andamento):
+def montar_doc_falha(payload, nome_comp, inicio_iso, fim_iso, contagem, em_andamento, situacao):
     """
     Monta o dicionário Python que representa a estrutura final do JSON da falha
     que será gravado na camada GOLD do S3.
@@ -533,6 +533,7 @@ def montar_doc_falha(payload, nome_comp, inicio_iso, fim_iso, contagem, em_andam
         "id_embarcado": payload["id_embarcado"],
         "endereco_mac": payload["endereco_mac"],
         "componente": nome_comp,
+        "situacao": situacao,
         "em_andamento": em_andamento,
         "data_inicio": inicio_iso,
         "data_fim": fim_iso,
@@ -600,6 +601,7 @@ def avaliar_e_gravar_falhas_s3(bucket, payloads):
                             ts_atual.isoformat(),
                             comp_estado["contagem"],
                             em_andamento=True,
+                            situacao=situacao
                         )
                         gravacoes_pendentes[destino] = doc
                 else:
@@ -615,6 +617,7 @@ def avaliar_e_gravar_falhas_s3(bucket, payloads):
                             ts_atual.isoformat(),
                             comp_estado["contagem"],
                             em_andamento=False,
+                            situacao=situacao,
                         )
                         # Garante que se a falha abriu e fechou no mesmo lote CSV, não grava em em_andamento
                         gravacoes_pendentes.pop(chave_ativa, None)
